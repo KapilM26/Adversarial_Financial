@@ -1,171 +1,126 @@
-import torch
-import torch.nn.functional as F
+import tensorflow as tf
 import numpy as np
+from tensorflow.keras import backend as K
 from datasets import load_dataset
-from tqdm import tqdm
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import random
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from torch.nn.utils.rnn import pad_sequence
-import torch.nn.functional as F
-from datasets import load_dataset
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras import models
 from tqdm import tqdm
-from torch.utils.data import DataLoader, TensorDataset
-from train_GRU import BidirectionalGRUClassifier, loss_function
+from tensorflow.keras.losses import sparse_categorical_crossentropy
 
 
+# Load the dataset from HuggingFace
+train_dataset = load_dataset("dllllb/rosbank-churn", "train")
+train_data = train_dataset['train']
+df_train = pd.DataFrame(train_data)
 
 def preprocess_rosbank_data(df):
     """
-    Preprocess the Rosbank dataset: Normalize numerical features, one-hot encode categorical ones, and 
-    group transactions into sequences (e.g., for each user or session).
+    Preprocess the Rosbank dataset for TensorFlow: Normalize numerical features, one-hot encode categorical ones, 
+    and group transactions into sequences (e.g., for each user or session).
     
     Args:
         df (pd.DataFrame): The raw transaction data.
         
     Returns:
-        X_train_tensor (torch.Tensor): Processed features as PyTorch tensor.
-        y_train_tensor (torch.Tensor): Target labels as PyTorch tensor.
+        X_sequences (list of np.array): List of padded sequences of features.
+        y_sequences (np.array): Corresponding labels.
+        sequence_lengths (list): Sequence lengths for each user's transactions.
     """
     # Handle missing data if any
-    df = df.dropna(subset=['amount', 'MCC', 'target_flag'])  # Drop rows with missing values in important columns
+    df = df.dropna(subset=['amount', 'MCC', 'target_flag', 'TRDATETIME'])
 
-    label_encoder = LabelEncoder()
-    df['MCC'] = label_encoder.fit_transform(df['MCC']) 
+    # Sort by user ID (cl_id) and timestamp (TRDATETIME) to ensure the transaction order for each user
+    df['TRDATETIME'] = pd.to_datetime(df['TRDATETIME'], format='%d%b%y:%H:%M:%S')
+    df = df.sort_values(by=['TRDATETIME'])  
 
-    # Normalize continuous features like 'amount'
+    # Normalize the numerical columns ('amount' and 'MCC')
     scaler = StandardScaler()
-    df['amount'] = scaler.fit_transform(df[['amount']]) 
+    df[['amount', 'MCC']] = scaler.fit_transform(df[['amount', 'MCC']])
 
-    # Group transactions by user (assuming ⁠ cl_id⁠  as user ID) and treat each user's transactions as a sequence
+    # Group transactions by user (assuming 'cl_id' as user ID) and treat each user's transactions as a sequence
     grouped = df.groupby('cl_id')
 
-    # Convert the features and target to lists of tensors (for sequence input to RNN)
+    # Convert the features and target to lists of arrays (for sequence input to RNN)
     X_sequences = []
     y_sequences = []
+    sequence_lengths = []
+
     for _, group in grouped:
-        # Convert the group (user's transactions) to a tensor of features (scaled amount, encoded MCC)
-        X_sequences.append(torch.tensor(group[['amount', 'MCC']].values, dtype=torch.float32))  
-        
-        # We take the last target flag of the group for classification
-        y_sequences.append(torch.tensor(group["target_flag"].values[-1], dtype=torch.long)) 
-    
+        X_sequences.append(group[['amount', 'MCC']].values)  # Features
+        y_sequences.append(group["target_flag"].values[-1])  # Target (last transaction)
+        sequence_lengths.append(len(group))  # Sequence length (number of transactions)
+
     # Pad sequences to ensure uniform length across the batch
-    padded_X_sequences = pad_sequence(X_sequences, batch_first=True, padding_value=0)  # Padding with zeros
-    padded_y_sequences = torch.tensor(y_sequences, dtype=torch.long)
+    padded_X_sequences = pad_sequences(X_sequences, padding='post', dtype='float32', value=0)
 
-    return padded_X_sequences, padded_y_sequences
+    y_sequences = np.array(y_sequences)
 
+    return padded_X_sequences, y_sequences, sequence_lengths
 
-# FGSM Attack Function
-def fgsm_attack(model, X, y, epsilon=1.0, n_steps=30):
+def fgsm_attack(model, X, y, epsilon=0.1, num_steps=30):
     """
-    Perform the Fast Gradient Sign Method (FGSM) attack with multiple steps.
+    Performs the Fast Gradient Sign Method (FGSM) attack on the model over multiple steps.
     
     Args:
-        model: The trained model.
-        X: Input features (batch of sequences).
-        y: True labels.
-        epsilon: Step size (perturbation magnitude).
-        n_steps: Number of steps for the iterative attack.
-    
+        model: The trained TensorFlow model.
+        X: The original input data (e.g., images or features).
+        y: The true labels for the input data.
+        epsilon: The magnitude of the perturbation (how much to perturb the input).
+        num_steps: Number of steps for perturbation (30 steps as per the user requirement).
+        
     Returns:
-        perturbed_X: The adversarially perturbed inputs.
+        X_adv: The adversarial examples generated by the FGSM attack.
     """
-    # Set requires_grad attribute of input to compute gradients
-    X.requires_grad = True
-    
-    # Start the attack with the original input
-    perturbed_X = X.clone()
-    
-    for step in range(n_steps):
-        # Forward pass the data through the model
-        output = model(perturbed_X)
+    # Make the input tensor of type float32 to allow gradient computation
+    X_tensor = tf.convert_to_tensor(X, dtype=tf.float32)
+    y_tensor = tf.convert_to_tensor(y, dtype=tf.int32)
+
+    # Apply the attack over multiple steps
+    for _ in tqdm(range(num_steps)):
+        with tf.GradientTape() as tape:
+            tape.watch(X_tensor)  # Watch the input for gradient computation
+            
+            # Get the model's prediction and calculate the loss
+            predictions = model(X_tensor)
+            loss = sparse_categorical_crossentropy(y_tensor, predictions)
         
-        # Compute the loss
-        loss = F.cross_entropy(output, y)
+        # Calculate the gradients of the loss with respect to the input image
+        gradients = tape.gradient(loss, X_tensor)
         
-        # Backpropagate the loss to get the gradients of the input
-        model.zero_grad()
-        loss.backward()
+        # Get the sign of the gradients to create the perturbation
+        perturbations = tf.sign(gradients)  # Sign of the gradients
         
-        # Get the sign of the gradients
-        sign_data_grad = perturbed_X.grad.data.sign()
-        
-        # Apply the perturbation
-        perturbed_X = perturbed_X + epsilon * sign_data_grad
-        
-        # Clamp the perturbed input to ensure it's within a valid range
-        perturbed_X = torch.clamp(perturbed_X, 0, 1)
+        # Generate adversarial examples by adding the perturbation to the input
+        X_tensor = X_tensor + epsilon * perturbations
     
-    return perturbed_X
-
-
-
-# Evaluate the model under attack
-def evaluate_model_under_attack(model, test_loader, epsilon=0.1):
-    """
-    Evaluate the model on the test set using adversarial examples generated by FGSM.
+        # Clip the values to ensure they stay within a valid range (if necessary)
+        X_tensor = tf.clip_by_value(X_tensor, 0.0, 1.0)  # Clip between 0 and 1 for images
     
-    Args:
-        model: The trained model.
-        test_loader: The DataLoader for the test set.
-        epsilon: Perturbation magnitude for FGSM.
-    
-    Returns:
-        accuracy: The accuracy of the model on the adversarial examples.
-        loss: The loss of the model on the adversarial examples.
-    """
-    model.eval()  # Set the model to evaluation mode
-    correct_predictions = 0
-    total = 0
-    test_loss = 0
-    
+    return X_tensor.numpy()  # Convert tensor to numpy array for further use
 
-    for batch_idx, (sequences, labels) in enumerate(test_loader):
-        # Generate adversarial examples using FGSM
-        perturbed_sequences = fgsm_attack(model, sequences, labels, epsilon)
-        
-        # Forward pass on the perturbed data
-        output = model(perturbed_sequences)
-        loss = loss_function(output, labels)
-        
-        test_loss += loss.item()  # Accumulate loss
-        
-        # Get predictions
-        _, predicted = torch.max(output, 1)
-        correct_predictions += (predicted == labels).sum().item()
-        total += labels.size(0)
-    
-    accuracy = correct_predictions / total  # Accuracy on the adversarial examples
-    avg_loss = test_loss / len(test_loader)  # Average loss on the adversarial examples
-    
-    return accuracy, avg_loss
+X_train_tensor, y_train_tensor, train_lengths = preprocess_rosbank_data(df_train)
 
+# Split the data into training and test sets
+X_train_tensor, X_test_tensor, y_train_tensor, y_test_tensor = train_test_split(X_train_tensor, y_train_tensor, test_size=0.35, random_state=42)
 
-train_dataset = load_dataset("dllllb/rosbank-churn", "train")
-train_data = train_dataset['train']
-df_train = pd.DataFrame(train_data)
+X_test_tensor = X_test_tensor[:50]
+y_test_tensor = y_test_tensor[:50]
+# Create and train the model
+input_shape = X_train_tensor.shape[1:]  # Shape of the input data
+original_model = models.load_model('best_GRU_model.h5')  # Load the original model for evaluation
+substitute_model = models.load_model('best_GRU_substitute_model.h5')  # Load the substitute model for evaluation
+# Evaluate the original model on original test data
+original_loss, original_accuracy = original_model.evaluate(X_test_tensor, y_test_tensor)
+print(f"Original Test Accuracy: {original_accuracy * 100:.2f}%")
 
-# Simple 65/35 split as requested
-train_df, test_df = train_test_split(df_train, test_size=0.35, random_state=42)
+# Perform FGSM attack on the substitute model
+epsilon = 1
+num_steps = 30
+X_adv = fgsm_attack(substitute_model, X_test_tensor, y_test_tensor, epsilon, num_steps)
 
-# Preprocess each dataset
-X_test_tensor, y_test_tensor = preprocess_rosbank_data(test_df)
-
-# Create DataLoaders for batched training
-batch_size = 1024
-test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-# Now, let's use the `evaluate_model_under_attack` function on the test data:
-epsilon = 1  # You can adjust the perturbation magnitude
-model = torch.load('best_GRU_epoch_11.pth', weights_only=False)
-
-attack_accuracy, attack_loss = evaluate_model_under_attack(model, test_loader, epsilon)
-print(f"Adversarial Test Accuracy: {attack_accuracy*100:.2f}%")
-print(f"Adversarial Test Loss: {attack_loss:.4f}")
+# Evaluate the original model on adversarial examples
+adversarial_loss, adversarial_accuracy = original_model.evaluate(X_adv, y_test_tensor)
+print(f"Adversarial Test Accuracy (epsilon={epsilon}): {adversarial_accuracy * 100:.2f}%")

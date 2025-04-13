@@ -8,7 +8,6 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from datasets import load_dataset
 import numpy as np
-from tqdm import tqdm
 
 # Load the dataset from HuggingFace
 train_dataset = load_dataset("dllllb/rosbank-churn", "train")
@@ -31,7 +30,7 @@ def preprocess_rosbank_data(df):
     # Handle missing data if any
     df = df.dropna(subset=['amount', 'MCC', 'target_flag', 'TRDATETIME'])
 
-    # Sort by user ID (cl_id) and timestamp (TRDATETIME) to ensure the transaction order for each user
+    # Sort by timestamp (TRDATETIME) to ensure the transaction order for each user
     df['TRDATETIME'] = pd.to_datetime(df['TRDATETIME'], format='%d%b%y:%H:%M:%S')
     df = df.sort_values(by=['TRDATETIME'])  
 
@@ -59,13 +58,14 @@ def preprocess_rosbank_data(df):
 
     return padded_X_sequences, y_sequences, sequence_lengths
 
-# Define a Bidirectional LSTM model in TensorFlow
 def create_model(input_shape):
     model = models.Sequential()
-    model.add(layers.Bidirectional(layers.LSTM(256, return_sequences=False), input_shape=input_shape))  # Bidirectional LSTM
-    model.add(layers.Dropout(0.1))  # Dropout layer
-    model.add(layers.Dense(2, activation='softmax'))  # Output layer for binary classification
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.add(layers.LSTM(256, return_sequences=False, input_shape=input_shape)) 
+    model.add(layers.Dropout(0.1))  
+    model.add(layers.Dense(2, activation='softmax'))  #
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), 
+                  loss='sparse_categorical_crossentropy', 
+                  metrics=['accuracy'])
     return model
 
 # Preprocess the data
@@ -76,12 +76,13 @@ X_train_tensor, X_test_tensor, y_train_tensor, y_test_tensor = train_test_split(
 
 # Create and train the model
 input_shape = X_train_tensor.shape[1:]  # Shape of the input data
-
+print('train original model')
 model = create_model(input_shape)
 
 # Set up callbacks for EarlyStopping and ModelCheckpoint
 early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1)
-checkpoint = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+checkpoint = ModelCheckpoint('best_LSTM_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+
 
 # Fit the model with callbacks
 history = model.fit(
@@ -94,4 +95,24 @@ history = model.fit(
 
 # Evaluate the model on the test set
 test_loss, test_accuracy = model.evaluate(X_test_tensor, y_test_tensor)
+print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
+
+# Train substitute model by switching train and test data
+print('train substitute model')
+model = create_model(input_shape)
+# Set up callbacks for EarlyStopping and ModelCheckpoint
+early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1)
+checkpoint = ModelCheckpoint('best_LSTM_substitute_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+
+# Fit the model with callbacks
+history = model.fit(
+    X_test_tensor, y_test_tensor, 
+    validation_data=(X_train_tensor, y_train_tensor),
+    epochs=50, 
+    batch_size=1024, 
+    callbacks=[early_stopping, checkpoint]
+)
+
+# Evaluate the model on the test set
+test_loss, test_accuracy = model.evaluate(X_train_tensor, y_train_tensor)
 print(f"Test Accuracy: {test_accuracy * 100:.2f}%")

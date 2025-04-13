@@ -197,10 +197,11 @@ X_test_tensor = X_test_tensor[:50]
 y_test_tensor = y_test_tensor[:50]
 # Create and train the model
 input_shape = X_train_tensor.shape[1:]  # Shape of the input data
-model = models.load_model('GRU_model.h5')  # Replace with your saved model path
+original_model = models.load_model('best_GRU_model.h5')  
+substitute_model = models.load_model('best_GRU_substitute_model.h5')
 
-# Evaluate the model on original test data
-original_loss, original_accuracy = model.evaluate(X_test_tensor, y_test_tensor)
+# Evaluate the orignal model on original test data
+original_loss, original_accuracy = original_model.evaluate(X_test_tensor, y_test_tensor)
 print(f"Original Test Accuracy: {original_accuracy * 100:.2f}%")
 
 # Parameters for the attacks
@@ -208,10 +209,10 @@ epsilon = 1
 num_steps = 30
 num_random_transactions = 5
 
-# Perform Concat FGSM (Sequential) attack
+# Perform Concat FGSM (Sequential) attack on the substitute model
 print("Running Concat FGSM (Sequential) attack...")
 X_adv_seq = concat_fgsm_attack_seq(
-    model=model,
+    model=substitute_model,
     X=X_test_tensor,
     y=y_test_tensor,
     epsilon=epsilon,
@@ -219,10 +220,10 @@ X_adv_seq = concat_fgsm_attack_seq(
     num_random_transactions=num_random_transactions
 )
 
-# Perform Concat FGSM (Simultaneous) attack
+# Perform Concat FGSM (Simultaneous) attack on the substitute model
 print("Running Concat FGSM (Simultaneous) attack...")
 X_adv_sim = concat_fgsm_attack_sim(
-    model=model,
+    model=substitute_model,
     X=X_test_tensor,
     y=y_test_tensor,
     epsilon=epsilon,
@@ -231,9 +232,9 @@ X_adv_sim = concat_fgsm_attack_sim(
 )
 
 
-# Evaluate the model on Concat FGSM adversarial examples
-seq_loss, seq_accuracy = model.evaluate(X_adv_seq, y_test_tensor)
-sim_loss, sim_accuracy = model.evaluate(X_adv_sim, y_test_tensor)
+# Evaluate the original model on Concat FGSM adversarial examples
+seq_loss, seq_accuracy = original_model.evaluate(X_adv_seq, y_test_tensor)
+sim_loss, sim_accuracy = original_model.evaluate(X_adv_sim, y_test_tensor)
 
 print(f"Concat FGSM [seq] Test Accuracy: {seq_accuracy * 100:.2f}%")
 print(f"Concat FGSM [sim] Test Accuracy: {sim_accuracy * 100:.2f}%")
